@@ -1,0 +1,162 @@
+name: Build & Release gemma_search
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+    paths:
+      - "gemma_search.py"
+      - ".github/workflows/release-gemma-search.yml"
+  pull_request:
+    paths:
+      - "gemma_search.py"
+      - ".github/workflows/release-gemma-search.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: gemma-build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+env:
+  PYTHON_VERSION: "3.11"
+  SCRIPT: gemma_search.py
+  BIN_NAME: gemma-search
+
+jobs:
+  build:
+    name: Build ${{ matrix.label }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            label: linux-x64
+            artifact: gemma-search-linux-x64
+            torch_index: https://download.pytorch.org/whl/cpu
+          - runner: macos-latest
+            label: macos-arm64
+            artifact: gemma-search-macos-arm64
+            torch_index: https://download.pytorch.org/whl/cpu
+          - runner: windows-latest
+            label: windows-x64
+            artifact: gemma-search-windows-x64
+            torch_index: https://download.pytorch.org/whl/cpu
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: |
+            gemma_search.py
+            .github/workflows/release-gemma-search.yml
+
+      - name: Install dependencies (CPU torch to keep binary small)
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install --extra-index-url ${{ matrix.torch_index }} \
+            torch \
+            transformers \
+            requests \
+            markdownify \
+            duckduckgo-search
+          pip install pyinstaller
+
+      - name: Resolve binary name
+        id: bin
+        shell: bash
+        run: |
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            echo "name=${{ env.BIN_NAME }}.exe" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=${{ env.BIN_NAME }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build executable with PyInstaller
+        shell: bash
+        run: |
+          pyinstaller \
+            --onefile \
+            --console \
+            --clean \
+            --name "${{ env.BIN_NAME }}" \
+            --hidden-import=duckduckgo_search \
+            --hidden-import=duckduckgo_search DDGS \
+            --hidden-import=markdownify \
+            --hidden-import=requests \
+            --hidden-import=transformers \
+            --hidden-import=transformers.models \
+            --hidden-import=transformers.models.auto \
+            --hidden-import=torch.nn \
+            --hidden-import=torch.nn.functional \
+            --hidden-import=torch.cuda \
+            --hidden-import=torch.backends.mps \
+            --collect-submodules=duckduckgo_search \
+            --collect-submodules=markdownify \
+            --collect-submodules=transformers.utils \
+            --collect-all=torch \
+            "${{ env.SCRIPT }}"
+
+      - name: Smoke-test executable
+        shell: bash
+        run: |
+          BIN="dist/${{ steps.bin.outputs.name }}"
+          ls -lh "$BIN"
+          "$BIN" --help
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ steps.bin.outputs.name }}
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: false
+
+      - name: Stage binaries
+        run: |
+          mkdir -p release
+          cp artifacts/gemma-search-linux-x64/${{ env.BIN_NAME }}      release/${{ env.BIN_NAME }}-linux-x64
+          cp artifacts/gemma-search-macos-arm64/${{ env.BIN_NAME }}    release/${{ env.BIN_NAME }}-macos-arm64
+          cp artifacts/gemma-search-windows-x64/${{ env.BIN_NAME }}.exe release/${{ env.BIN_NAME }}-windows-x64.exe
+          chmod +x release/${{ env.BIN_NAME }}-linux-x64 release/${{ env.BIN_NAME }}-macos-arm64
+          ls -lh release
+
+      - name: Generate checksums
+        run: |
+          cd release
+          shasum -a 256 * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/${{ env.BIN_NAME }}-linux-x64
+            release/${{ env.BIN_NAME }}-macos-arm64
+            release/${{ env.BIN_NAME }}-windows-x64.exe
+            release/SHA256SUMS.txt
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
