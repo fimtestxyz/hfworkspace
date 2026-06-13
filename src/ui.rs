@@ -39,6 +39,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             draw_models(f, app);
             draw_download_popup(f, app);
         }
+        Mode::SearchPopup => {
+            draw_models(f, app);
+            draw_search_popup(f, app);
+        }
     }
 }
 
@@ -57,13 +61,15 @@ fn draw_models(f: &mut Frame, app: &mut App) {
         .split(f.area());
 
     // ── Header ──
+    let filter_indicator = if app.show_installed_only { " [Installed Only]" } else { "" };
     let header = Paragraph::new(Line::from(vec![
         Span::styled("  🤗 ", Style::default().fg(YELLOW)),
         Span::styled("HuggingFace ", Style::default().fg(TEXT).bold()),
         Span::styled("Model Manager", Style::default().fg(ACCENT).bold()),
+        Span::styled(filter_indicator, Style::default().fg(PEACH).bold()),
         Span::raw("  "),
         Span::styled(
-            "Tab=Chat  d=Download  ?=Help  q=Quit",
+            "Tab=Chat  s=Search  i=Installed  d=Download  ?=Help  q=Quit",
             Style::default().fg(SUBTEXT),
         ),
     ]))
@@ -71,9 +77,22 @@ fn draw_models(f: &mut Frame, app: &mut App) {
     f.render_widget(header, chunks[0]);
 
     // ── Model List ──
+    let display_indices: Vec<usize> = if app.show_installed_only {
+        app.models
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| matches!(m.status, ModelStatus::Downloaded | ModelStatus::Loaded))
+            .map(|(i, _)| i)
+            .collect()
+    } else {
+        (0..app.models.len()).collect()
+    };
+    app.display_indices = display_indices;
+
     let items: Vec<ListItem> = app
-        .models
+        .display_indices
         .iter()
+        .map(|&i| &app.models[i])
         .map(|m| {
             let status_style = match &m.status {
                 ModelStatus::Downloaded => Style::default().fg(GREEN),
@@ -105,6 +124,13 @@ fn draw_models(f: &mut Frame, app: &mut App) {
         })
         .collect();
 
+    let list_count = app.display_indices.len();
+    let list_title = if app.show_installed_only {
+        format!("Installed ({list_count})")
+    } else {
+        format!("Models ({list_count})")
+    };
+
     let list = List::new(items)
         .block(
             Block::default()
@@ -112,7 +138,7 @@ fn draw_models(f: &mut Frame, app: &mut App) {
                 .border_style(Style::default().fg(MAUVE))
                 .title(Line::from(vec![
                     Span::styled(" 📦 ", Style::default().fg(PEACH)),
-                    Span::styled("Models", Style::default().fg(TEXT).bold()),
+                    Span::styled(list_title, Style::default().fg(TEXT).bold()),
                 ]))
                 .style(Style::default().bg(Color::Reset)),
         )
@@ -327,6 +353,153 @@ fn draw_download_popup(f: &mut Frame, app: &App) {
 }
 
 // ═══════════════════════════════════════════════════════════
+//  SEARCH POPUP
+// ═══════════════════════════════════════════════════════════
+
+fn draw_search_popup(f: &mut Frame, app: &mut App) {
+    let area = centered_rect(75, 70, f.area());
+    f.render_widget(Clear, area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Length(1),
+            Constraint::Min(3),
+            Constraint::Length(1),
+        ])
+        .split(area);
+
+    // ── Search input ──
+    let input = Paragraph::new(Line::from(vec![
+        Span::styled(" > ", Style::default().fg(GREEN)),
+        Span::styled(&app.search_input, Style::default().fg(TEXT)),
+        Span::styled("▌", Style::default().fg(ACCENT)),
+    ]))
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(ACCENT))
+            .title(Line::from(vec![
+                Span::styled(" 🔍 ", Style::default().fg(YELLOW)),
+                Span::styled("Search HuggingFace Hub", Style::default().fg(TEXT).bold()),
+            ]))
+            .style(Style::default().bg(SURFACE)),
+    );
+    f.render_widget(input, chunks[0]);
+
+    // ── Hint line ──
+    let hint = if app.search_results.is_empty() && !app.search_loading {
+        "  Type a query and press Enter to search  ·  Esc=Cancel"
+    } else if app.search_loading {
+        "  Searching..."
+    } else {
+        "  ↑/↓=Navigate  Enter=Install  Esc=Cancel"
+    };
+    let hint_line = Paragraph::new(Line::from(Span::styled(
+        hint,
+        Style::default().fg(SUBTEXT).italic(),
+    )))
+    .style(Style::default().bg(SURFACE));
+    f.render_widget(hint_line, chunks[1]);
+
+    // ── Results list ──
+    if app.search_loading {
+        let loading = Paragraph::new(Line::from(Span::styled(
+            "  ⏳ Loading results...",
+            Style::default().fg(YELLOW),
+        )))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(MAUVE))
+                .style(Style::default().bg(Color::Reset)),
+        );
+        f.render_widget(loading, chunks[2]);
+    } else if app.search_results.is_empty() {
+        let empty = Paragraph::new(Line::from(Span::styled(
+            "  No results. Type a search query above.",
+            Style::default().fg(SUBTEXT),
+        )))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(MAUVE))
+                .title(Line::from(vec![
+                    Span::styled(" Results ", Style::default().fg(TEXT).bold()),
+                ]))
+                .style(Style::default().bg(Color::Reset)),
+        );
+        f.render_widget(empty, chunks[2]);
+    } else {
+        let items: Vec<ListItem> = app
+            .search_results
+            .iter()
+            .map(|r| {
+                let downloads = format_downloads(r.downloads);
+                let task = r.pipeline_tag.as_deref().unwrap_or("—");
+                let line = Line::from(vec![
+                    Span::styled(&r.repo_id, Style::default().fg(TEXT).bold()),
+                    Span::raw("  "),
+                    Span::styled(format!("↓{downloads}"), Style::default().fg(GREEN)),
+                    Span::raw("  "),
+                    Span::styled(format!("♥{}", r.likes), Style::default().fg(RED)),
+                    Span::raw("  "),
+                    Span::styled(format!("[{task}]"), Style::default().fg(TEAL)),
+                ]);
+                ListItem::new(line)
+            })
+            .collect();
+
+        let result_count = app.search_results.len();
+        let list = List::new(items)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(MAUVE))
+                    .title(Line::from(vec![
+                        Span::styled(
+                            format!(" Results ({result_count}) "),
+                            Style::default().fg(TEXT).bold(),
+                        ),
+                    ]))
+                    .style(Style::default().bg(Color::Reset)),
+            )
+            .highlight_style(
+                Style::default()
+                    .bg(ACCENT)
+                    .fg(Color::Black)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("▶ ");
+
+        f.render_stateful_widget(list, chunks[2], &mut app.search_list_state);
+    }
+
+    // ── Footer ──
+    let footer = Paragraph::new(Line::from(Span::styled(
+        format!(
+            " {} result{}  ·  Enter=Install selected  ·  Esc=Close",
+            app.search_results.len(),
+            if app.search_results.len() == 1 { "" } else { "s" },
+        ),
+        Style::default().fg(TEAL),
+    )))
+    .style(Style::default().bg(SURFACE));
+    f.render_widget(footer, chunks[3]);
+}
+
+fn format_downloads(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}K", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════
 //  HELP POPUP
 // ═══════════════════════════════════════════════════════════
 
@@ -348,6 +521,14 @@ fn draw_help_popup(f: &mut Frame) {
         Line::from(vec![
             Span::styled("  d         ", Style::default().fg(PEACH).bold()),
             Span::styled("Download model (popup)", Style::default().fg(TEXT)),
+        ]),
+        Line::from(vec![
+            Span::styled("  s         ", Style::default().fg(PEACH).bold()),
+            Span::styled("Search HuggingFace Hub", Style::default().fg(TEXT)),
+        ]),
+        Line::from(vec![
+            Span::styled("  i         ", Style::default().fg(PEACH).bold()),
+            Span::styled("Toggle installed-only filter", Style::default().fg(TEXT)),
         ]),
         Line::from(vec![
             Span::styled("  l / Enter  ", Style::default().fg(PEACH).bold()),

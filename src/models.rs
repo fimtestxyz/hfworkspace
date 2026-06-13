@@ -2,7 +2,7 @@ use anyhow::Result;
 use hf_hub::{Cache, Repo, RepoType};
 use std::path::PathBuf;
 
-use super::app::{ModelEntry, ModelStatus};
+use super::app::{ModelEntry, ModelStatus, SearchResult};
 
 /// Manages HuggingFace model cache and downloads
 pub struct ModelManager {
@@ -147,6 +147,88 @@ impl ModelManager {
         } else {
             Ok(format!("{repo_id} not found in cache"))
         }
+    }
+
+    /// Scan the HF cache directory for all installed models
+    pub fn list_installed_models(&self) -> Vec<ModelEntry> {
+        let cache_path = self.cache.path().to_path_buf();
+        if !cache_path.exists() {
+            return Vec::new();
+        }
+
+        let mut entries = Vec::new();
+        let Ok(dir_entries) = std::fs::read_dir(&cache_path) else {
+            return Vec::new();
+        };
+
+        for entry in dir_entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !name.starts_with("models--") {
+                continue;
+            }
+
+            // Convert cache folder name back to repo_id:
+            // "models--google--gemma-2-2b-it" -> "google/gemma-2-2b-it"
+            let repo_id = name
+                .strip_prefix("models--")
+                .unwrap_or(&name)
+                .replace("--", "/");
+
+            let size_mb = self.get_local_size(&repo_id);
+
+            entries.push(ModelEntry {
+                repo_id,
+                status: ModelStatus::Downloaded,
+                size_mb,
+                description: "Installed (local cache)".to_string(),
+                last_used: None,
+            });
+        }
+
+        entries.sort_by(|a, b| a.repo_id.cmp(&b.repo_id));
+        entries
+    }
+
+    /// Search HuggingFace Hub API for models matching a query
+    pub async fn search_models(&self, query: &str) -> Result<Vec<SearchResult>> {
+        let client = reqwest::Client::new();
+        let resp = client
+            .get("https://huggingface.co/api/models")
+            .query(&[
+                ("search", query),
+                ("limit", "20"),
+                ("sort", "downloads"),
+                ("direction", "-1"),
+            ])
+            .send()
+            .await?
+            .json::<Vec<serde_json::Value>>()
+            .await?;
+
+        let results = resp
+            .into_iter()
+            .filter_map(|v| {
+                let repo_id = v.get("id")?.as_str()?.to_string();
+                let downloads = v
+                    .get("downloads")
+                    .and_then(|d| d.as_u64())
+                    .unwrap_or(0);
+                let likes = v.get("likes").and_then(|l| l.as_u64()).unwrap_or(0);
+                let pipeline_tag = v
+                    .get("pipeline_tag")
+                    .and_then(|t| t.as_str())
+                    .map(|s| s.to_string());
+
+                Some(SearchResult {
+                    repo_id,
+                    downloads,
+                    likes,
+                    pipeline_tag,
+                })
+            })
+            .collect();
+
+        Ok(results)
     }
 
     /// Get the local path for a downloaded model

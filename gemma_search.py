@@ -9,7 +9,9 @@ from threading import Thread
 import sys
 import os
 import json
+import atexit
 from datetime import datetime
+import readline
 
 import requests
 from markdownify import markdownify as md
@@ -149,11 +151,13 @@ def print_help():
     """Print help/controls."""
     print(f"\n{C.SURFACE1}  ── Controls ───────────────────────────────────────{C.RESET}")
     print(f"  {C.PEACH}{C.BOLD}Enter{C.RESET}    {C.SUBTEXT0}Send message{C.RESET}")
+    print(f"  {C.PEACH}{C.BOLD}↑ / ↓{C.RESET}    {C.SUBTEXT0}Browse previous commands (persistent){C.RESET}")
     print(f"  {C.PEACH}{C.BOLD}Ctrl+C{C.RESET}   {C.SUBTEXT0}Interrupt generation or quit{C.RESET}")
     print(f"  {C.PEACH}{C.BOLD}/quit{C.RESET}    {C.SUBTEXT0}Exit the chat{C.RESET}")
     print(f"  {C.PEACH}{C.BOLD}/help{C.RESET}    {C.SUBTEXT0}Show this help{C.RESET}")
     print(f"  {C.PEACH}{C.BOLD}/clear{C.RESET}   {C.SUBTEXT0}Clear conversation history{C.RESET}")
     print(f"  {C.PEACH}{C.BOLD}/model{C.RESET}   {C.SUBTEXT0}Show current model/info{C.RESET}")
+    print(f"  {C.PEACH}{C.BOLD}/switch{C.RESET}  {C.SUBTEXT0}Switch to a different installed model{C.RESET}")
     print(f"\n{C.SURFACE1}  ── Search ────────────────────────────────────────{C.RESET}")
     print(f"  {C.PEACH}{C.BOLD}/search <query>{C.RESET}  {C.SUBTEXT0}General web search{C.RESET}")
     print(f"  {C.PEACH}{C.BOLD}/news <query>{C.RESET}    {C.SUBTEXT0}News search with timestamps{C.RESET}")
@@ -458,6 +462,39 @@ class WebSearchManager:
 
 # ─── Model Loading ─────────────────────────────────────────
 
+def list_installed_models():
+    """Scan the HuggingFace cache directory for installed models."""
+    cache_dir = os.path.expanduser("~/.cache/huggingface/hub")
+    if not os.path.isdir(cache_dir):
+        return []
+
+    models = []
+    for entry in sorted(os.listdir(cache_dir)):
+        if entry.startswith("models--"):
+            repo_id = entry[len("models--"):].replace("--", "/")
+            # Estimate size from snapshots directory
+            snap_dir = os.path.join(cache_dir, entry, "snapshots")
+            size_mb = 0
+            if os.path.isdir(snap_dir):
+                for root, _dirs, files in os.walk(snap_dir):
+                    for f in files:
+                        fp = os.path.join(root, f)
+                        try:
+                            size_mb += os.path.getsize(fp)
+                        except OSError:
+                            pass
+                size_mb = size_mb // (1024 * 1024)
+            models.append({"repo_id": repo_id, "size_mb": size_mb})
+    return models
+
+
+def unload_model(model):
+    """Free GPU/CPU memory by deleting the model and clearing CUDA cache."""
+    del model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 def load_gemma_model(model_name="google/gemma-3-4b-it"):
     """
     Load a Gemma model from HuggingFace.
@@ -604,6 +641,37 @@ def format_chat_prompt(messages, tokenizer, search_context=None):
         return prompt
 
 
+# ─── Input History ─────────────────────────────────────────
+
+def setup_input_history():
+    """Configure readline arrow-up/down history with cross-session persistence."""
+    cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "gemma_search")
+    os.makedirs(cache_dir, exist_ok=True)
+    history_path = os.path.join(cache_dir, "input_history")
+
+    readline.set_history_length(1000)
+    readline.parse_and_bind("set disable-completion on")
+    readline.parse_and_bind(r'"\e[A": previous-history')
+    readline.parse_and_bind(r'"\e[B": next-history')
+    readline.parse_and_bind(r'"\eOA": previous-history')
+    readline.parse_and_bind(r'"\eOB": next-history')
+
+    try:
+        readline.read_history_file(history_path)
+    except FileNotFoundError:
+        pass
+
+    def _save():
+        try:
+            readline.write_history_file(history_path)
+        except OSError:
+            pass
+
+    atexit.register(_save)
+
+    return history_path, _save
+
+
 # ─── Interactive Chat ──────────────────────────────────────
 
 def interactive_chat(model_name="google/gemma-3-4b-it"):
@@ -612,6 +680,9 @@ def interactive_chat(model_name="google/gemma-3-4b-it"):
     """
     # Initialize web search manager
     web_search = WebSearchManager()
+
+    # Configure readline history (arrow up/down + persistence)
+    _history_path, _save_history = setup_input_history()
 
     # Clear screen and show banner
     print("\033[2J\033[H", end="")
@@ -636,6 +707,19 @@ def interactive_chat(model_name="google/gemma-3-4b-it"):
         try:
             print_user_msg("")
             user_input = input().strip()
+
+            # Strip auto-added blank entries so arrow-up stays clean
+            hist_len = readline.get_current_history_length()
+            while hist_len > 0:
+                entry = readline.get_history_item(hist_len)
+                if entry is None or entry.strip() == "":
+                    readline.remove_history_item(hist_len - 1)
+                    hist_len -= 1
+                else:
+                    break
+
+            if user_input:
+                _save_history()
 
             # Slash commands
             if user_input.startswith("/"):
@@ -663,6 +747,80 @@ def interactive_chat(model_name="google/gemma-3-4b-it"):
                     print_system(f"Messages: {len(messages)}")
                     print_system(f"Searches: {len(web_search.search_history)}")
                     print()
+                    continue
+                elif user_input.lower().startswith("/switch"):
+                    parts = user_input.split(None, 1)
+                    target = parts[1].strip() if len(parts) > 1 else ""
+
+                    installed = list_installed_models()
+                    if not installed and not target:
+                        print_error("No models found in HuggingFace cache")
+                        print_info("Use the Rust TUI or 'huggingface-cli download' to install models")
+                        continue
+
+                    if target:
+                        chosen = target
+                    else:
+                        print()
+                        print(styled("  ── Installed Models ──────────────────────────────────", C.MAUVE))
+                        current_idx = None
+                        for i, m in enumerate(installed, 1):
+                            marker = styled(" ● ", C.GREEN) if m["repo_id"] == model_name else styled("   ", C.SUBTEXT0)
+                            size = f"{m['size_mb']} MB" if m['size_mb'] else "unknown"
+                            print(f"  {marker}{C.PEACH}{i:2d}{C.RESET}  {C.TEXT}{m['repo_id']}{C.RESET}  {C.SUBTEXT0}({size}){C.RESET}")
+                            if m["repo_id"] == model_name:
+                                current_idx = i
+                        print(styled("  ─────────────────────────────────────────────────────", C.MAUVE))
+                        if current_idx:
+                            print(f"  {C.SUBTEXT0}● = currently loaded{C.RESET}")
+                        print()
+                        print(f"  {C.TEXT}Enter number or repo ID to switch (Esc to cancel):{C.RESET} ", end="", flush=True)
+                        choice = input().strip()
+                        if not choice:
+                            print_info("Switch cancelled")
+                            continue
+                        if choice.isdigit():
+                            idx = int(choice) - 1
+                            if 0 <= idx < len(installed):
+                                chosen = installed[idx]["repo_id"]
+                            else:
+                                print_error(f"Invalid number: {choice}")
+                                continue
+                        else:
+                            chosen = choice
+
+                    if chosen == model_name:
+                        print_info(f"Already using {chosen}")
+                        continue
+
+                    print()
+                    print_system(f"Switching from {model_name} → {chosen}")
+                    print_system("Unloading current model...")
+                    unload_model(model)
+                    tokenizer = None
+                    model = None
+                    print_system("Loading new model...")
+                    print()
+
+                    try:
+                        tokenizer, model = load_gemma_model(chosen)
+                        model_name = chosen
+                        messages.clear()
+                        turn_count = 0
+                        last_search_results = None
+                        print()
+                        print(styled(f"  ✓ Switched to {model_name}", C.GREEN, C.BOLD))
+                        print_info("Conversation cleared (new model context)")
+                        print()
+                    except Exception as e:
+                        print_error(f"Failed to load {chosen}: {e}")
+                        print_system("Attempting to reload previous model...")
+                        try:
+                            tokenizer, model = load_gemma_model(model_name)
+                            print_success(f"Restored {model_name}")
+                        except Exception as e2:
+                            print_error(f"Failed to restore previous model: {e2}")
+                            print_error("Session is in an invalid state. Restart recommended.")
                     continue
                 elif user_input.lower() == "/history":
                     web_search.show_history()
@@ -859,6 +1017,11 @@ if __name__ == "__main__":
         print(f"    {C.SKY}/fetch <url>{C.RESET}        {C.SUBTEXT0}Fetch and read a webpage{C.RESET}")
         print(f"    {C.SKY}/site <domain> <q>{C.RESET}  {C.SUBTEXT0}Search a specific site{C.RESET}")
         print(f"    {C.SKY}/history{C.RESET}            {C.SUBTEXT0}View search/fetch history{C.RESET}")
+        print()
+        print(f"  {C.TEXT}Model:{C.RESET}")
+        print(f"    {C.PEACH}/model{C.RESET}              {C.SUBTEXT0}Show current model info{C.RESET}")
+        print(f"    {C.PEACH}/switch{C.RESET}             {C.SUBTEXT0}Switch to a different installed model{C.RESET}")
+        print(f"    {C.PEACH}/switch <repo_id>{C.RESET}   {C.SUBTEXT0}Switch directly to a model{C.RESET}")
         print()
         print(f"  {C.TEXT}Trader Research:{C.RESET}")
         print(f"    {C.SKY}/x <query>{C.RESET}          {C.SUBTEXT0}Search X / Twitter{C.RESET}")

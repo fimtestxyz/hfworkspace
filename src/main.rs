@@ -34,12 +34,21 @@ async fn main() -> anyhow::Result<()> {
     let model_manager = Arc::new(ModelManager::new()?);
     let mut app = App::new();
 
-    // Populate model list from HF cache
-    app.models = model_manager.list_models();
+    // Merge installed models with the popular model catalog
+    let mut models = model_manager.list_models();
+    let installed = model_manager.list_installed_models();
+    for inst in installed {
+        if !models.iter().any(|m| m.repo_id == inst.repo_id) {
+            models.push(inst);
+        }
+    }
+    app.models = models;
+
     if app.models.is_empty() {
-        app.set_status("No models found. Press 'd' to download one.");
+        app.set_status("No models found. Press 'd' to download or 's' to search.");
     } else {
-        app.set_status(format!("Found {} models in catalog", app.models.len()));
+        let installed_count = app.models.iter().filter(|m| matches!(m.status, app::ModelStatus::Downloaded | app::ModelStatus::Loaded)).count();
+        app.set_status(format!("{} models ({} installed)", app.models.len(), installed_count));
     }
 
     // ── Spawn crossterm key listener ───────────────────

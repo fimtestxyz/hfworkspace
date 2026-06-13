@@ -6,6 +6,7 @@ pub enum Mode {
     Models,
     Chat,
     DownloadPopup,
+    SearchPopup,
     Help,
 }
 
@@ -15,6 +16,7 @@ impl fmt::Display for Mode {
             Mode::Models => write!(f, "Models"),
             Mode::Chat => write!(f, "Chat"),
             Mode::DownloadPopup => write!(f, "Download"),
+            Mode::SearchPopup => write!(f, "Search"),
             Mode::Help => write!(f, "Help"),
         }
     }
@@ -67,6 +69,15 @@ pub enum MessageRole {
     System,
 }
 
+/// Search result from HuggingFace Hub API
+#[derive(Debug, Clone)]
+pub struct SearchResult {
+    pub repo_id: String,
+    pub downloads: u64,
+    pub likes: u64,
+    pub pipeline_tag: Option<String>,
+}
+
 /// Application state
 #[allow(dead_code)]
 pub struct App {
@@ -90,6 +101,16 @@ pub struct App {
 
     // Popup
     pub popup_scroll: u16,
+
+    // Search
+    pub search_input: String,
+    pub search_results: Vec<SearchResult>,
+    pub search_list_state: ratatui::widgets::ListState,
+    pub search_loading: bool,
+
+    // Filter
+    pub show_installed_only: bool,
+    pub display_indices: Vec<usize>,
 }
 
 impl App {
@@ -114,6 +135,14 @@ impl App {
             loaded_model: None,
             streaming_text: String::new(),
             popup_scroll: 0,
+
+            search_input: String::new(),
+            search_results: Vec::new(),
+            search_list_state: ratatui::widgets::ListState::default(),
+            search_loading: false,
+
+            show_installed_only: false,
+            display_indices: Vec::new(),
         }
     }
 

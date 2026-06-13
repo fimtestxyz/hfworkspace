@@ -4,7 +4,7 @@ use crossterm::event::KeyModifiers;
 use crossterm::event::KeyEvent;
 use tokio::sync::mpsc;
 
-use crate::app::{App, ChatMessage, MessageRole, Mode, ModelStatus};
+use crate::app::{App, ChatMessage, MessageRole, Mode, ModelStatus, SearchResult};
 use crate::models::ModelManager;
 
 pub enum AppEvent {
@@ -15,6 +15,8 @@ pub enum AppEvent {
     StreamToken(String),
     StreamComplete,
     StreamError(String),
+    SearchResults(Vec<SearchResult>),
+    SearchError(String),
 }
 
 pub async fn handle_events(
@@ -67,6 +69,20 @@ pub async fn handle_events(
                 content: format!("Generation error: {err}"),
             });
         }
+        AppEvent::SearchResults(results) => {
+            app.search_loading = false;
+            app.search_results = results;
+            if app.search_results.is_empty() {
+                app.set_status("No search results found");
+            } else {
+                app.set_status(format!("Found {} results", app.search_results.len()));
+            }
+            app.search_list_state.select(Some(0));
+        }
+        AppEvent::SearchError(err) => {
+            app.search_loading = false;
+            app.set_status(format!("Search error: {err}"));
+        }
     }
 }
 
@@ -91,6 +107,7 @@ async fn handle_key_event(
         Mode::Models => handle_models_keys(app, key_event, model_manager, event_sender).await,
         Mode::Chat => handle_chat_keys(app, key_event, event_sender),
         Mode::DownloadPopup => handle_download_popup_keys(app, key_event, model_manager, event_sender),
+        Mode::SearchPopup => handle_search_popup_keys(app, key_event, model_manager, event_sender).await,
         Mode::Help => {}
     }
 }
@@ -112,80 +129,92 @@ async fn handle_models_keys(
             app.mode = Mode::Help;
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            let i = match app.model_list_state.selected() {
-                Some(i) => {
-                    if i >= app.models.len().saturating_sub(1) {
-                        0
-                    } else {
-                        i + 1
-                    }
-                }
-                None => 0,
-            };
-            app.model_list_state.select(Some(i));
+            let len = app.display_indices.len();
+            if len > 0 {
+                let i = match app.model_list_state.selected() {
+                    Some(i) if i < len - 1 => i + 1,
+                    _ => 0,
+                };
+                app.model_list_state.select(Some(i));
+            }
         }
         KeyCode::Up | KeyCode::Char('k') => {
-            let i = match app.model_list_state.selected() {
-                Some(i) => {
-                    if i == 0 {
-                        app.models.len().saturating_sub(1)
-                    } else {
-                        i - 1
-                    }
-                }
-                None => 0,
-            };
-            app.model_list_state.select(Some(i));
+            let len = app.display_indices.len();
+            if len > 0 {
+                let i = match app.model_list_state.selected() {
+                    Some(0) => len - 1,
+                    Some(i) => i - 1,
+                    None => 0,
+                };
+                app.model_list_state.select(Some(i));
+            }
         }
         KeyCode::Char('d') => {
             app.download_input.clear();
             app.mode = Mode::DownloadPopup;
         }
+        KeyCode::Char('s') => {
+            app.search_input.clear();
+            app.search_results.clear();
+            app.search_loading = false;
+            app.search_list_state.select(None);
+            app.mode = Mode::SearchPopup;
+        }
+        KeyCode::Char('i') => {
+            app.show_installed_only = !app.show_installed_only;
+            if app.show_installed_only {
+                app.set_status("Showing installed models only");
+            } else {
+                app.set_status("Showing all models");
+            }
+        }
         KeyCode::Char('x') => {
-            if let Some(index) = app.model_list_state.selected() {
-                if let Some(m) = app.models.get(index) {
-                    let repo_id = m.repo_id.clone();
-                    match model_manager.delete_model(&repo_id) {
-                        Ok(msg) => {
-                            app.set_status(msg);
-                            if let Some(m_mut) = app.models.get_mut(index) {
-                                m_mut.status = ModelStatus::NotDownloaded;
-                                m_mut.size_mb = None;
+            if let Some(selected) = app.model_list_state.selected() {
+                if let Some(&real_index) = app.display_indices.get(selected) {
+                    if let Some(m) = app.models.get(real_index) {
+                        let repo_id = m.repo_id.clone();
+                        match model_manager.delete_model(&repo_id) {
+                            Ok(msg) => {
+                                app.set_status(msg);
+                                if let Some(m_mut) = app.models.get_mut(real_index) {
+                                    m_mut.status = ModelStatus::NotDownloaded;
+                                    m_mut.size_mb = None;
+                                }
                             }
+                            Err(e) => app.set_status(format!("Error: {e}")),
                         }
-                        Err(e) => app.set_status(format!("Error: {e}")),
                     }
                 }
             }
         }
         KeyCode::Enter | KeyCode::Char('l') => {
-            if let Some(index) = app.model_list_state.selected() {
-                // Clone repo_id before mutating
-                let repo_id = app.models.get(index).map(|m| m.repo_id.clone());
-                let status = app.models.get(index).map(|m| m.status.clone());
+            if let Some(selected) = app.model_list_state.selected() {
+                if let Some(&real_index) = app.display_indices.get(selected) {
+                    let repo_id = app.models.get(real_index).map(|m| m.repo_id.clone());
+                    let status = app.models.get(real_index).map(|m| m.status.clone());
 
-                if let (Some(repo_id), Some(status)) = (repo_id, status) {
-                    match status {
-                        ModelStatus::Downloaded | ModelStatus::Loaded => {
-                            // Unload previous
-                            if let Some(loaded_repo) = &app.loaded_model {
-                                if let Some(old) = app.models.iter_mut().find(|x| x.repo_id == *loaded_repo) {
-                                    old.status = ModelStatus::Downloaded;
+                    if let (Some(repo_id), Some(status)) = (repo_id, status) {
+                        match status {
+                            ModelStatus::Downloaded | ModelStatus::Loaded => {
+                                // Unload previous
+                                if let Some(loaded_repo) = &app.loaded_model {
+                                    if let Some(old) = app.models.iter_mut().find(|x| x.repo_id == *loaded_repo) {
+                                        old.status = ModelStatus::Downloaded;
+                                    }
                                 }
+                                app.loaded_model = Some(repo_id.clone());
+                                app.set_status(format!("Loaded model: {repo_id}"));
+                                if let Some(m_mut) = app.models.get_mut(real_index) {
+                                    m_mut.status = ModelStatus::Loaded;
+                                }
+                                app.mode = Mode::Chat;
                             }
-                            app.loaded_model = Some(repo_id.clone());
-                            app.set_status(format!("Loaded model: {repo_id}"));
-                            if let Some(m_mut) = app.models.get_mut(index) {
-                                m_mut.status = ModelStatus::Loaded;
+                            ModelStatus::NotDownloaded => {
+                                app.set_status(format!("Starting download for {repo_id}..."));
+                                trigger_download(repo_id, model_manager, event_sender);
                             }
-                            // Auto switch to chat
-                            app.mode = Mode::Chat;
+                            _ => {}
                         }
-                        ModelStatus::NotDownloaded => {
-                            app.set_status(format!("Starting download for {repo_id}..."));
-                            trigger_download(repo_id, model_manager, event_sender);
-                        }
-                        _ => {}
                     }
                 }
             }
@@ -280,6 +309,101 @@ fn handle_download_popup_keys(
         }
         _ => {}
     }
+}
+
+async fn handle_search_popup_keys(
+    app: &mut App,
+    key_event: KeyEvent,
+    model_manager: Arc<ModelManager>,
+    event_sender: mpsc::Sender<AppEvent>,
+) {
+    match key_event.code {
+        KeyCode::Esc => {
+            app.mode = Mode::Models;
+        }
+        KeyCode::Char(c) if !app.search_loading => {
+            app.search_input.push(c);
+        }
+        KeyCode::Backspace if !app.search_loading => {
+            app.search_input.pop();
+        }
+        KeyCode::Enter if !app.search_loading => {
+            if !app.search_results.is_empty() {
+                // Download selected result
+                if let Some(idx) = app.search_list_state.selected() {
+                    if let Some(result) = app.search_results.get(idx) {
+                        let repo_id = result.repo_id.clone();
+                        if !app.models.iter().any(|m| m.repo_id == repo_id) {
+                            app.models.push(crate::app::ModelEntry {
+                                repo_id: repo_id.clone(),
+                                status: ModelStatus::NotDownloaded,
+                                size_mb: None,
+                                description: format!(
+                                    "{}",
+                                    result.pipeline_tag.as_deref().unwrap_or("model")
+                                ),
+                                last_used: None,
+                            });
+                        }
+                        app.set_status(format!("Starting download for {repo_id}..."));
+                        app.mode = Mode::Models;
+                        trigger_download(repo_id, model_manager, event_sender);
+                    }
+                }
+            } else if !app.search_input.trim().is_empty() {
+                let query = app.search_input.clone();
+                app.search_loading = true;
+                app.search_results.clear();
+                app.search_list_state.select(None);
+                app.set_status(format!("Searching for \"{query}\"..."));
+                trigger_search(query, model_manager, event_sender);
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') if !app.search_results.is_empty() => {
+            let i = match app.search_list_state.selected() {
+                Some(i) => {
+                    if i >= app.search_results.len().saturating_sub(1) {
+                        0
+                    } else {
+                        i + 1
+                    }
+                }
+                None => 0,
+            };
+            app.search_list_state.select(Some(i));
+        }
+        KeyCode::Up | KeyCode::Char('k') if !app.search_results.is_empty() => {
+            let i = match app.search_list_state.selected() {
+                Some(i) => {
+                    if i == 0 {
+                        app.search_results.len().saturating_sub(1)
+                    } else {
+                        i - 1
+                    }
+                }
+                None => 0,
+            };
+            app.search_list_state.select(Some(i));
+        }
+        _ => {}
+    }
+}
+
+fn trigger_search(
+    query: String,
+    model_manager: Arc<ModelManager>,
+    event_sender: mpsc::Sender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        match model_manager.search_models(&query).await {
+            Ok(results) => {
+                let _ = event_sender.send(AppEvent::SearchResults(results)).await;
+            }
+            Err(e) => {
+                let _ = event_sender.send(AppEvent::SearchError(e.to_string())).await;
+            }
+        }
+    });
 }
 
 fn trigger_download(
