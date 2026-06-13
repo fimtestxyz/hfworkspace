@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[oc]
+*.pyd
+build/
+dist/
+wheels/
+*.egg-info
+*.egg
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# uv
+.uv/
+
+# Rust
+/target/
+
+# HuggingFace / ML artifacts
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.onnx
+*.gguf
+cache/
+models/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Environment
+.env
+.env.*
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Tools
+.qoder/
+.codegraph/
